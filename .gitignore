@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/
+*.swp
