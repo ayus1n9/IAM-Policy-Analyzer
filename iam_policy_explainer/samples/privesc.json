@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AssumableRoleWithPassRoleAndRunInstances",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole", "ec2:RunInstances"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SilentPolicyEscalation",
+      "Effect": "Allow",
+      "Action": "iam:CreatePolicyVersion",
+      "Resource": "arn:aws:iam::123456789012:policy/ReadOnlyPolicy"
+    },
+    {
+      "Sid": "AssumeRoleBroad",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "*"
+    }
+  ]
+}
