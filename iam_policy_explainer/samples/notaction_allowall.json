@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowAllExceptS3",
+      "Effect": "Allow",
+      "NotAction": "s3:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowAllExceptIamPassRole",
+      "Effect": "Allow",
+      "NotAction": "iam:PassRole",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowAllExceptEverything",
+      "Effect": "Allow",
+      "NotAction": "*",
+      "Resource": "*"
+    }
+  ]
+}

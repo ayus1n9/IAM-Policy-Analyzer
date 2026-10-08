@@ -118,6 +118,25 @@ def normalize_to_list(value):
         return value
     return [value]
 
+def normalize_principal(principal):
+    """Flatten an IAM Principal into a list of principal values."""
+    if principal is None:
+        return []
+    if isinstance(principal, str):
+        return [principal]
+    if isinstance(principal, list):
+        return list(principal)
+    if isinstance(principal, dict):
+        values = []
+        for value in principal.values():
+            if isinstance(value, list):
+                values.extend(value)
+            else:
+                values.append(value)
+        return values
+    return [principal]
+
+
 def principal_contains_wildcard(principal):
     """Return True when an IAM Principal contains a wildcard value."""
     if principal == "*":
@@ -153,6 +172,39 @@ def detect_privesc(analysis):
         return []
 
     actions = analysis["actions"]
+    not_actions = analysis["not_actions"]
+
+    # NotAction means every action except the excluded set. Treat this as a
+    # static heuristic: report known privilege-escalation actions that remain
+    # possible rather than claiming the exact effective permission set.
+    if not_actions:
+        not_lower = [a.lower() for a in not_actions if isinstance(a, str)]
+        if "*" in not_lower:
+            return []
+
+        excluded = set()
+        for not_action in not_lower:
+            if not_action in PRIVESC_ACTIONS:
+                excluded.add(not_action)
+            elif not_action.endswith(":*"):
+                service_prefix = not_action.split(":")[0] + ":"
+                excluded.update(
+                    action
+                    for action in PRIVESC_ACTIONS
+                    if action.startswith(service_prefix)
+                )
+
+        remaining = set(PRIVESC_ACTIONS) - excluded
+        if remaining:
+            return [{
+                "action": f"NotAction: {', '.join(map(str, not_actions))}",
+                "reason": (
+                    "Allow with NotAction may still permit known privilege-escalation "
+                    f"actions; {len(remaining)} known action(s) remain possible"
+                ),
+            }]
+        return []
+
     actions_lower = [a.lower() for a in actions if isinstance(a, str)]
 
     if "*" in actions_lower:
@@ -186,14 +238,39 @@ def detect_privesc(analysis):
     return findings
 
 
-def has_passrole_and_compute(actions):
-    """True if PassRole appears alongside a compute action (or '*')."""
-    actions_lower = [a.lower() for a in actions if isinstance(a, str)]
+def has_passrole_and_compute(analysis):
+    """True if PassRole and at least one compute action can both be allowed."""
+    actions_lower = [
+        a.lower() for a in analysis["actions"] if isinstance(a, str)
+    ]
+    not_actions_lower = [
+        a.lower() for a in analysis["not_actions"] if isinstance(a, str)
+    ]
+
+    if analysis["not_actions"]:
+        if "*" in not_actions_lower:
+            return False
+
+        def excluded(action):
+            service = action.split(":")[0] + ":"
+            return any(
+                item == action or item == service + "*"
+                for item in not_actions_lower
+            )
+
+        passrole_allowed = not excluded("iam:passrole")
+        compute_allowed = any(
+            not excluded(action) for action in COMPUTE_ACTIONS
+        )
+        return passrole_allowed and compute_allowed
+
     if "*" in actions_lower:
         return True
+
     if "iam:passrole" not in actions_lower:
         return False
-    return any(a in COMPUTE_ACTIONS for a in actions_lower)
+
+    return any(action in COMPUTE_ACTIONS for action in actions_lower)
 
 
 def analyze_statement(statement):
@@ -204,6 +281,7 @@ def analyze_statement(statement):
     resources = normalize_to_list(statement.get("Resource"))
     not_resources = normalize_to_list(statement.get("NotResource"))
     principal = statement.get("Principal")
+    principals = normalize_principal(principal)
     has_condition = "Condition" in statement
 
     has_star_action = "*" in actions
@@ -220,6 +298,12 @@ def analyze_statement(statement):
         or bool(not_resources)
     )
 
+    not_actions_lower = [a.lower() for a in not_actions if isinstance(a, str)]
+
+    # NotAction:"*" excludes every action, so the Allow statement
+    # grants no effective actions. Do not classify it as overly permissive.
+    no_effective_actions = "*" in not_actions_lower
+
     risk_reasons = []
 
     if effect == "Allow":
@@ -227,28 +311,35 @@ def analyze_statement(statement):
             risk_reasons.append("Action is '*' (all actions on all services)")
         if has_service_wildcard:
             risk_reasons.append("Wildcard service action like 's3:*'")
-        if not_actions:
+        if not_actions and not no_effective_actions:
             risk_reasons.append(
                 "Uses NotAction with Allow (can grant broader permissions than intended)"
             )
-        if has_star_resource:
+        if has_star_resource and not no_effective_actions:
             risk_reasons.append("Resource is '*' (all resources)")
         if not_resources:
             risk_reasons.append("Uses NotResource with Allow")
-        if not has_condition and has_wildcard:
+        if not has_condition and has_wildcard and not no_effective_actions:
             risk_reasons.append("No Condition block to constrain the wildcard")
         if has_public_principal:
             risk_reasons.append("Principal is '*' — potentially public")
 
-    is_overly_permissive = (
-        effect == "Allow"
-        and (
-            has_star_action
-            or has_service_wildcard
-            or has_star_resource
-            or bool(not_resources)
+        has_broad_not_action = (
+            bool(not_actions)
+            and not no_effective_actions
         )
-    )
+
+        is_overly_permissive = (
+            effect == "Allow"
+            and not no_effective_actions
+            and (
+                has_star_action
+                or has_service_wildcard
+                or has_star_resource
+                or has_broad_not_action
+                or bool(not_resources)
+            )
+        )
 
     analysis = {
         "effect": effect,
@@ -257,12 +348,14 @@ def analyze_statement(statement):
         "resources": resources,
         "not_resources": not_resources,
         "principal": principal,
+        "principals": principals,
+        "is_public": has_public_principal,
         "has_condition": has_condition,
         "risk_reasons": risk_reasons,
         "is_overly_permissive": is_overly_permissive,
     }
     analysis["privesc_findings"] = detect_privesc(analysis)
-    analysis["has_passrole_and_compute"] = has_passrole_and_compute(actions)
+    analysis["has_passrole_and_compute"] = has_passrole_and_compute(analysis)
     return analysis
 
 
@@ -284,7 +377,20 @@ def score_statement(analysis):
     )
     has_public_principal = principal_contains_wildcard(analysis["principal"])
 
-    if has_star_action and has_star_resource and not has_condition:
+    # NotAction:"*" excludes every action, so this statement grants no actions.
+    if any(
+        isinstance(item, str) and item.lower() == "*"
+        for item in not_actions
+    ):
+        return "LOW"
+
+    if (
+        has_public_principal
+        and (has_star_action or has_star_resource)
+        and not has_condition
+    ):
+        severity = "CRITICAL"
+    elif has_star_action and has_star_resource and not has_condition:
         severity = "CRITICAL"
     elif has_star_action or has_public_principal:
         severity = "HIGH"
@@ -331,10 +437,15 @@ def format_statement_summary(statement, index, analysis, severity):
             f"  NotResource: {', '.join(map(str, analysis['not_resources']))}"
         )
 
+    if analysis["principals"]:
+        lines.append(
+            f"  Principal: {', '.join(map(str, analysis['principals']))}"
+        )
+
     lines.append(f"  Condition: {'yes' if analysis['has_condition'] else 'no'}")
 
-    if analysis["principal"] is not None:
-        lines.append(f"  Principal: {analysis['principal']}")
+    if analysis["is_public"]:
+        lines.append("  Public access: YES (Principal is '*')")
 
     if analysis["is_overly_permissive"]:
         lines.append("  Assessment: OVERLY PERMISSIVE")
@@ -376,6 +487,7 @@ def print_overall_summary(analyses, severities):
     allow_count = sum(1 for a in analyses if a["effect"] == "Allow")
     deny_count = sum(1 for a in analyses if a["effect"] == "Deny")
     risky = [i + 1 for i, a in enumerate(analyses) if a["is_overly_permissive"]]
+    public = [i + 1 for i, a in enumerate(analyses) if a["is_public"]]
     privesc_count = sum(len(a["privesc_findings"]) for a in analyses)
     worst = highest_severity(severities)
 
@@ -388,6 +500,9 @@ def print_overall_summary(analyses, severities):
     print(f"Overly permissive      : {len(risky)}")
     if risky:
         print(f"Risky statement #s     : {', '.join(map(str, risky))}")
+    print(f"Public access          : {len(public)}")
+    if public:
+        print(f"Public statement #s    : {', '.join(map(str, public))}")
     print(f"Privesc findings       : {privesc_count}")
     print(f"Highest severity       : {worst}")
 
@@ -395,6 +510,7 @@ def print_overall_summary(analyses, severities):
 def build_report(policy, policy_path, statements, analyses, severities):
     """Build a machine-readable report dict for --json output."""
     total_privesc = sum(len(a["privesc_findings"]) for a in analyses)
+    public_count = sum(1 for a in analyses if a["is_public"])
     return {
         "file": policy_path,
         "version": policy.get("Version", "unknown"),
@@ -405,6 +521,7 @@ def build_report(policy, policy_path, statements, analyses, severities):
             "overly_permissive": sum(
                 1 for a in analyses if a["is_overly_permissive"]
             ),
+            "public_access": public_count,
             "privesc_findings": total_privesc,
             "highest_severity": highest_severity(severities),
         },
@@ -419,6 +536,8 @@ def build_report(policy, policy_path, statements, analyses, severities):
                 "resources": analysis["resources"],
                 "not_resources": analysis["not_resources"],
                 "principal": analysis["principal"],
+                "principals": analysis["principals"],
+                "is_public": analysis["is_public"],
                 "has_condition": analysis["has_condition"],
                 "is_overly_permissive": analysis["is_overly_permissive"],
                 "risk_reasons": analysis["risk_reasons"],
@@ -460,6 +579,9 @@ def main():
                 )
                 print(
                     f"  [verbose] resources normalized: {analyses[i - 1]['resources']}"
+                )
+                print(
+                    f"  [verbose] principals normalized: {analyses[i - 1]['principals']}"
                 )
             print()
 
