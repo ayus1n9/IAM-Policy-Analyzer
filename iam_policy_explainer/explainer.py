@@ -61,9 +61,6 @@ COMPUTE_ACTIONS = {
 
 SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 SEVERITY_LADDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
-
-# These keys can narrow the set of principals or network locations, but only
-# when paired with a restrictive operator and a meaningful value.
 STRONG_CONDITION_KEYS = {
     "aws:sourceip",
     "aws:sourcevpc",
@@ -385,6 +382,163 @@ def has_passrole_and_compute(analysis):
     return any(action in COMPUTE_ACTIONS for action in actions_lower)
 
 
+SERVICE_READONLY_HINTS = {
+    "s3": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+    "ec2": ["ec2:DescribeInstances", "ec2:DescribeSecurityGroups", "ec2:DescribeVpcs"],
+    "iam": ["iam:GetUser", "iam:ListUsers", "iam:GetRole", "iam:ListRoles"],
+    "lambda": [
+        "lambda:GetFunction",
+        "lambda:ListFunctions",
+        "lambda:GetFunctionConfiguration",
+    ],
+    "dynamodb": [
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:DescribeTable",
+    ],
+    "logs": ["logs:DescribeLogGroups", "logs:DescribeLogStreams", "logs:GetLogEvents"],
+    "kms": ["kms:DescribeKey", "kms:ListKeys"],
+}
+
+
+def _has_passed_to_service_condition(condition):
+    """Return True when a condition explicitly constrains iam:PassedToService."""
+    if not isinstance(condition, dict):
+        return False
+    for operator, key_values in condition.items():
+        if operator not in {"StringEquals", "StringLike"} or not isinstance(key_values, dict):
+            continue
+        for key, value in key_values.items():
+            if not isinstance(key, str) or key.lower() != "iam:passedtoservice":
+                continue
+            values = value if isinstance(value, list) else [value]
+            if values and all(
+                isinstance(item, str) and item.strip() and "*" not in item
+                for item in values
+            ):
+                return True
+    return False
+
+
+def suggest_least_privilege(analysis):
+    """Return human-readable, heuristic suggestions for narrowing an Allow statement."""
+    if analysis["effect"] != "Allow" or analysis.get("no_effective_actions", False):
+        return []
+
+    suggestions = []
+    actions = analysis["actions"]
+    resources = analysis["resources"]
+    not_actions = analysis["not_actions"]
+    actions_lower = [a.lower() for a in actions if isinstance(a, str)]
+
+    # Rule 1: Action "*" grants every action.
+    if "*" in actions_lower:
+        suggestions.append({
+            "target": "Action",
+            "current": "*",
+            "suggestion": (
+                "Replace with the minimum action set the principal actually needs. "
+                "Use CloudTrail or service access logs to identify required actions; "
+                "AWS IAM Access Analyzer can help generate a least-privilege policy."
+            ),
+        })
+
+    # Rule 2: service wildcards such as s3:* or lambda:*.
+    seen_services = set()
+    for action in actions:
+        if not isinstance(action, str):
+            continue
+        key = action.lower()
+        if key == "*" or not key.endswith(":*"):
+            continue
+        service = key.split(":", 1)[0]
+        if service in seen_services:
+            continue
+        seen_services.add(service)
+        hints = SERVICE_READONLY_HINTS.get(service)
+        if hints:
+            suggestion = (
+                f"Replace {action} with the specific {service} actions required. "
+                f"Possible read-oriented starting points: {', '.join(hints)}. "
+                "Verify data-access needs before adopting these examples."
+            )
+        else:
+            suggestion = (
+                f"Replace {action} with the specific {service} actions required. "
+                "Use CloudTrail or service access logs to identify actual usage."
+            )
+        suggestions.append({
+            "target": "Action",
+            "current": action,
+            "suggestion": suggestion,
+        })
+
+    # Rule 3: Resource "*" grants access across all resources supported by the action.
+    if any(isinstance(resource, str) and resource == "*" for resource in resources):
+        suggestions.append({
+            "target": "Resource",
+            "current": "*",
+            "suggestion": (
+                "Scope the statement to the specific resource ARNs required. "
+                "For example, use a bucket/object ARN or a specific IAM role ARN "
+                "where the AWS action supports resource-level permissions."
+            ),
+        })
+
+    # Rule 4: constrain iam:PassRole to intended service(s) and role ARN(s).
+    if "iam:passrole" in actions_lower and not _has_passed_to_service_condition(
+        analysis.get("condition", {}).get("raw")
+    ):
+        suggestions.append({
+            "target": "Condition",
+            "current": "missing or unrecognized iam:PassedToService restriction",
+            "suggestion": (
+                "Constrain iam:PassRole with a StringEquals condition on "
+                "iam:PassedToService for the intended AWS service, and scope "
+                "Resource to specific role ARNs. Review the actual service workflow."
+            ),
+        })
+
+    # Rule 5: wildcard principal without a recognized strong condition.
+    if analysis["is_public"] and analysis["condition"]["strong_count"] == 0:
+        suggestions.append({
+            "target": "Principal",
+            "current": "*",
+            "suggestion": (
+                "If access is not intentionally public, replace '*' with specific "
+                "principals or account IDs. For intended service access, evaluate "
+                "aws:SourceAccount and aws:SourceArn; for organization-scoped access, "
+                "consider aws:PrincipalOrgID. Source-IP restrictions are appropriate "
+                "only when network location is the intended boundary."
+            ),
+        })
+
+    # Rule 6: NotAction is difficult to reason about and can expand as AWS adds actions.
+    if not_actions:
+        suggestions.append({
+            "target": "NotAction",
+            "current": ", ".join(map(str, not_actions)),
+            "suggestion": (
+                "Prefer an explicit Action allow-list. With Allow + NotAction, all "
+                "actions except the exclusions may be allowed, subject to resource "
+                "and other policy constraints."
+            ),
+        })
+
+    # Rule 7: NotResource can implicitly cover resources beyond the exclusions.
+    if analysis["not_resources"]:
+        suggestions.append({
+            "target": "NotResource",
+            "current": ", ".join(map(str, analysis["not_resources"])),
+            "suggestion": (
+                "Prefer explicit Resource ARNs when practical. Review the full set "
+                "of resources that remain included by NotResource."
+            ),
+        })
+
+    return suggestions
+
+
 def analyze_statement(statement):
     """Return normalized fields, condition analysis, risk flags and findings."""
     effect = statement.get("Effect", "Unknown")
@@ -475,6 +629,7 @@ def analyze_statement(statement):
     }
     analysis["privesc_findings"] = detect_privesc(analysis)
     analysis["has_passrole_and_compute"] = has_passrole_and_compute(analysis)
+    analysis["suggestions"] = suggest_least_privilege(analysis)
     return analysis
 
 
@@ -629,6 +784,13 @@ def format_statement_summary(statement, index, analysis, severity):
                     "impact depends on the permissions of the passed role"
                 )
 
+    if analysis.get("suggestions"):
+        lines.append("  Suggested tightening:")
+        for suggestion in analysis["suggestions"]:
+            lines.append(
+                f"    - [{suggestion['target']}] {suggestion['suggestion']}"
+            )
+
     return "\n".join(lines)
 
 
@@ -665,6 +827,7 @@ def print_overall_summary(analyses, severities):
     privesc_count = sum(
         len(a["privesc_findings"]) for a in analyses
     )
+    suggestion_count = sum(len(a.get("suggestions", [])) for a in analyses)
 
     mitigated = [
         i + 1
@@ -708,6 +871,7 @@ def print_overall_summary(analyses, severities):
         print(f"Mitigated statement #s : {', '.join(map(str, mitigated))}")
 
     print(f"Privesc findings       : {privesc_count}")
+    print(f"Suggestions            : {suggestion_count}")
     print(f"Highest severity       : {worst}")
 
 
@@ -716,6 +880,7 @@ def build_report(policy, policy_path, statements, analyses, severities):
     total_privesc = sum(len(a["privesc_findings"]) for a in analyses)
     public_count = sum(1 for a in analyses if a["is_public"])
     mitigated_count = sum(1 for a in analyses if a["condition"]["strong_count"] > 0)
+    suggestion_count = sum(len(a.get("suggestions", [])) for a in analyses)
     return {
         "file": policy_path,
         "version": policy.get("Version", "unknown"),
@@ -727,6 +892,7 @@ def build_report(policy, policy_path, statements, analyses, severities):
             "public_access": public_count,
             "with_strong_mitigations": mitigated_count,
             "privesc_findings": total_privesc,
+            "suggestions": suggestion_count,
             "highest_severity": highest_severity(severities),
             "wildcard_principal_statements": sum(
                 1 for a in analyses if a["is_public"]
@@ -764,6 +930,7 @@ def build_report(policy, policy_path, statements, analyses, severities):
                 "risk_reasons": analysis["risk_reasons"],
                 "privesc_findings": analysis["privesc_findings"],
                 "has_passrole_and_compute": analysis["has_passrole_and_compute"],
+                "suggestions": analysis.get("suggestions", []),
             }
             for i, (stmt, analysis) in enumerate(zip(statements, analyses))
         ],

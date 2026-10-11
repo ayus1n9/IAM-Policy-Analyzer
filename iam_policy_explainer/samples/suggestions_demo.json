@@ -1,0 +1,42 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Admin",
+      "Effect": "Allow",
+      "Action": "*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3Wildcard",
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": "arn:aws:s3:::my-bucket/*"
+    },
+    {
+      "Sid": "PassRoleNoCondition",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole", "ec2:RunInstances"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PublicWrite",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-bucket/*"
+    },
+    {
+      "Sid": "NotActionAllow",
+      "Effect": "Allow",
+      "NotAction": "iam:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "Clean",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::my-bucket/*"
+    }
+  ]
+}
