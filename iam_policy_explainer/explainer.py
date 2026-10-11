@@ -1,5 +1,6 @@
 import argparse
 import json
+import ipaddress
 import sys
 
 
@@ -59,6 +60,27 @@ COMPUTE_ACTIONS = {
 }
 
 SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+SEVERITY_LADDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+# These keys can narrow the set of principals or network locations, but only
+# when paired with a restrictive operator and a meaningful value.
+STRONG_CONDITION_KEYS = {
+    "aws:sourceip",
+    "aws:sourcevpc",
+    "aws:sourcevpce",
+    "aws:principalorgid",
+    "aws:sourceaccount",
+    "aws:sourcearn",
+    "aws:principalarn",
+}
+RESTRICTING_OPERATORS = {
+    "IpAddress",
+    "StringEquals",
+    "StringLike",
+    "ArnEquals",
+    "ArnLike",
+    "StringEqualsIgnoreCase",
+}
 
 
 def parse_args():
@@ -164,6 +186,96 @@ def get_statements(policy):
     if isinstance(stmt, list):
         return stmt
     return []
+
+
+def _condition_values_are_restrictive(key, operator, value):
+    """Conservatively decide whether a condition value meaningfully narrows access."""
+    values = value if isinstance(value, list) else [value]
+    if not values:
+        return False
+
+    for item in values:
+        if not isinstance(item, (str, int, float)):
+            return False
+        text = str(item).strip()
+        if not text or "*" in text:
+            return False
+
+        if key.lower() == "aws:sourceip":
+            try:
+                network = ipaddress.ip_network(text, strict=False)
+                if network.prefixlen == 0:
+                    return False
+            except ValueError:
+                return False
+
+    return True
+
+
+def analyze_condition(condition):
+    """Summarize recognized IAM condition mitigations without validating IAM syntax."""
+    result = {
+        "present": isinstance(condition, dict) and bool(condition),
+        "mitigations": [],
+        "strong_count": 0,
+        "weak_count": 0,
+        "raw": condition,
+    }
+    if not result["present"]:
+        return result
+
+    for operator, key_values in condition.items():
+        if not isinstance(operator, str) or not isinstance(key_values, dict):
+            continue
+        for key, value in key_values.items():
+            if not isinstance(key, str):
+                continue
+            key_lower = key.lower()
+            operator_is_restricting = operator in RESTRICTING_OPERATORS
+            value_is_restrictive = _condition_values_are_restrictive(
+                key, operator, value
+            )
+
+            if key_lower == "aws:multifactorauthpresent":
+                value_text = str(value).lower()
+                if operator == "Bool" and value_text == "true":
+                    result["mitigations"].append({
+                        "key": key,
+                        "operator": operator,
+                        "strength": "strong",
+                        "reason": "Requires MFA",
+                    })
+                    result["strong_count"] += 1
+                elif operator == "BoolIfExists" and value_text == "true":
+                    result["mitigations"].append({
+                        "key": key,
+                        "operator": operator,
+                        "strength": "weak",
+                        "reason": "MFA check uses BoolIfExists and may not constrain requests when the key is absent",
+                    })
+                    result["weak_count"] += 1
+
+            elif key_lower in STRONG_CONDITION_KEYS:
+                if operator_is_restricting and value_is_restrictive:
+                    result["mitigations"].append({
+                        "key": key,
+                        "operator": operator,
+                        "strength": "strong",
+                        "reason": f"Restricts access using {key} and {operator}",
+                    })
+                    result["strong_count"] += 1
+
+            elif key_lower == "aws:securetransport":
+                if operator == "Bool" and str(value).lower() == "true":
+                    result["mitigations"].append({
+                        "key": key,
+                        "operator": operator,
+                        "strength": "weak",
+                        "reason": "Requires secure transport; this protects transport, not principal scope",
+                    })
+                    result["weak_count"] += 1
+
+    return result
 
 
 def detect_privesc(analysis):
@@ -274,7 +386,7 @@ def has_passrole_and_compute(analysis):
 
 
 def analyze_statement(statement):
-    """Return normalized fields + risk flags + privesc findings."""
+    """Return normalized fields, condition analysis, risk flags and findings."""
     effect = statement.get("Effect", "Unknown")
     actions = normalize_to_list(statement.get("Action"))
     not_actions = normalize_to_list(statement.get("NotAction"))
@@ -282,14 +394,22 @@ def analyze_statement(statement):
     not_resources = normalize_to_list(statement.get("NotResource"))
     principal = statement.get("Principal")
     principals = normalize_principal(principal)
-    has_condition = "Condition" in statement
+    condition_analysis = analyze_condition(statement.get("Condition"))
+    has_condition = condition_analysis["present"]
 
-    has_star_action = "*" in actions
+    has_star_action = any(isinstance(a, str) and a == "*" for a in actions)
     has_service_wildcard = any(
         isinstance(a, str) and a.lower().endswith(":*") for a in actions
     )
-    has_star_resource = "*" in resources
+    has_star_resource = any(isinstance(r, str) and r == "*" for r in resources)
     has_public_principal = principal_contains_wildcard(principal)
+
+    not_actions_lower = [
+        a.lower() for a in not_actions if isinstance(a, str)
+    ]
+    # An Allow statement with NotAction:"*" has no effective allowed actions.
+    no_effective_actions = "*" in not_actions_lower
+
     has_wildcard = (
         has_star_action
         or has_service_wildcard
@@ -298,48 +418,45 @@ def analyze_statement(statement):
         or bool(not_resources)
     )
 
-    not_actions_lower = [a.lower() for a in not_actions if isinstance(a, str)]
-
-    # NotAction:"*" excludes every action, so the Allow statement
-    # grants no effective actions. Do not classify it as overly permissive.
-    no_effective_actions = "*" in not_actions_lower
-
     risk_reasons = []
-
-    if effect == "Allow":
+    if effect == "Allow" and not no_effective_actions:
         if has_star_action:
             risk_reasons.append("Action is '*' (all actions on all services)")
         if has_service_wildcard:
             risk_reasons.append("Wildcard service action like 's3:*'")
-        if not_actions and not no_effective_actions:
+        if not_actions:
             risk_reasons.append(
                 "Uses NotAction with Allow (can grant broader permissions than intended)"
             )
-        if has_star_resource and not no_effective_actions:
+        if has_star_resource:
             risk_reasons.append("Resource is '*' (all resources)")
         if not_resources:
             risk_reasons.append("Uses NotResource with Allow")
-        if not has_condition and has_wildcard and not no_effective_actions:
+        if not has_condition and has_wildcard:
             risk_reasons.append("No Condition block to constrain the wildcard")
-        if has_public_principal:
-            risk_reasons.append("Principal is '*' — potentially public")
-
-        has_broad_not_action = (
-            bool(not_actions)
-            and not no_effective_actions
-        )
-
-        is_overly_permissive = (
-            effect == "Allow"
-            and not no_effective_actions
-            and (
-                has_star_action
-                or has_service_wildcard
-                or has_star_resource
-                or has_broad_not_action
-                or bool(not_resources)
+        if has_public_principal and condition_analysis["strong_count"] == 0:
+            risk_reasons.append(
+                "Principal contains '*' with no recognized strong restriction — potentially public"
             )
+        elif has_public_principal:
+            risk_reasons.append(
+                "Principal contains '*' but a recognized Condition restricts access; verify the guardrail"
+            )
+
+    has_broad_not_action = bool(not_actions) and not no_effective_actions
+    is_overly_permissive = (
+        effect == "Allow"
+        and not no_effective_actions
+        and (
+            has_star_action
+            or has_service_wildcard
+            or has_star_resource
+            or has_broad_not_action
+            or bool(not_resources)
         )
+    )
+    # A wildcard principal on a no-action statement is not effective public access.
+    is_public = effect == "Allow" and has_public_principal and not no_effective_actions
 
     analysis = {
         "effect": effect,
@@ -349,8 +466,10 @@ def analyze_statement(statement):
         "not_resources": not_resources,
         "principal": principal,
         "principals": principals,
-        "is_public": has_public_principal,
+        "is_public": is_public,
         "has_condition": has_condition,
+        "condition": condition_analysis,
+        "no_effective_actions": no_effective_actions,
         "risk_reasons": risk_reasons,
         "is_overly_permissive": is_overly_permissive,
     }
@@ -359,53 +478,74 @@ def analyze_statement(statement):
     return analysis
 
 
+
+def _downgrade(severity, levels):
+    """Lower severity by N levels, with a floor of LOW."""
+    if severity not in SEVERITY_LADDER:
+        return severity
+    index = SEVERITY_LADDER.index(severity)
+    return SEVERITY_LADDER[max(1, index - levels)]
+
+
 def score_statement(analysis):
-    """Return a severity label for a single statement."""
+    """Return a heuristic severity label for a single statement."""
     if analysis["effect"] != "Allow":
         return "INFO"
 
+    if analysis["no_effective_actions"]:
+        return "LOW"
+
     actions = analysis["actions"]
     resources = analysis["resources"]
-    not_actions = analysis["not_actions"]
     not_resources = analysis["not_resources"]
-    has_condition = analysis["has_condition"]
+    strong_mitigations = analysis["condition"]["strong_count"]
 
-    has_star_action = "*" in actions
-    has_star_resource = "*" in resources
+    has_star_action = any(isinstance(a, str) and a == "*" for a in actions)
+    has_star_resource = any(isinstance(r, str) and r == "*" for r in resources)
     has_service_wildcard = any(
         isinstance(a, str) and a.lower().endswith(":*") for a in actions
     )
-    has_public_principal = principal_contains_wildcard(analysis["principal"])
-
-    # NotAction:"*" excludes every action, so this statement grants no actions.
-    if any(
-        isinstance(item, str) and item.lower() == "*"
-        for item in not_actions
-    ):
-        return "LOW"
 
     if (
-        has_public_principal
+        analysis["is_public"]
         and (has_star_action or has_star_resource)
-        and not has_condition
+        and strong_mitigations == 0
     ):
         severity = "CRITICAL"
-    elif has_star_action and has_star_resource and not has_condition:
+    elif has_star_action and has_star_resource and strong_mitigations == 0:
         severity = "CRITICAL"
-    elif has_star_action or has_public_principal:
+    elif has_star_action or analysis["is_public"] or analysis["not_actions"]:
         severity = "HIGH"
     elif has_service_wildcard or has_star_resource or not_resources:
         severity = "MEDIUM"
     else:
         severity = "LOW"
 
+    # Conditions do not erase privilege-escalation capability for callers who
+    # satisfy them, so do not downgrade a statement with privesc findings.
     if analysis["privesc_findings"]:
         if analysis["has_passrole_and_compute"]:
             severity = "CRITICAL"
         elif SEVERITY_ORDER[severity] < SEVERITY_ORDER["HIGH"]:
             severity = "HIGH"
+        return severity
+
+    # A recognized condition can reduce exposure, but it does not narrow a
+    # wildcard Action/Resource or neutralize privilege-escalation capability.
+    # Apply at most a one-level downgrade only when the statement is otherwise
+    # scoped; this is a heuristic, not AWS policy validation.
+    broad_scope = (
+        has_star_action
+        or has_star_resource
+        or has_service_wildcard
+        or bool(not_resources)
+        or bool(analysis["not_actions"])
+    )
+    if strong_mitigations > 0 and not broad_scope:
+        severity = _downgrade(severity, 1)
 
     return severity
+
 
 
 def highest_severity(severities):
@@ -445,7 +585,18 @@ def format_statement_summary(statement, index, analysis, severity):
     lines.append(f"  Condition: {'yes' if analysis['has_condition'] else 'no'}")
 
     if analysis["is_public"]:
-        lines.append("  Public access: YES (Principal is '*')")
+        if analysis["condition"]["strong_count"]:
+            lines.append("  Public access: YES but restricted by recognized Condition (verify guardrail)")
+        else:
+            lines.append("  Public access: YES (Principal contains '*', no recognized strong restriction)")
+
+    if analysis["condition"]["mitigations"]:
+        lines.append("  Condition mitigations:")
+        for mitigation in analysis["condition"]["mitigations"]:
+            lines.append(
+                f"    - [{mitigation['strength']}] {mitigation['operator']} "
+                f"{mitigation['key']}: {mitigation['reason']}"
+            )
 
     if analysis["is_overly_permissive"]:
         lines.append("  Assessment: OVERLY PERMISSIVE")
@@ -486,9 +637,41 @@ def print_overall_summary(analyses, severities):
     total = len(analyses)
     allow_count = sum(1 for a in analyses if a["effect"] == "Allow")
     deny_count = sum(1 for a in analyses if a["effect"] == "Deny")
-    risky = [i + 1 for i, a in enumerate(analyses) if a["is_overly_permissive"]]
-    public = [i + 1 for i, a in enumerate(analyses) if a["is_public"]]
-    privesc_count = sum(len(a["privesc_findings"]) for a in analyses)
+
+    risky = [
+        i + 1
+        for i, a in enumerate(analyses)
+        if a["is_overly_permissive"]
+    ]
+
+    public = [
+        i + 1
+        for i, a in enumerate(analyses)
+        if a["is_public"]
+    ]
+
+    public_without_strong = [
+        i + 1
+        for i, a in enumerate(analyses)
+        if a["is_public"] and a["condition"]["strong_count"] == 0
+    ]
+
+    public_with_strong = [
+        i + 1
+        for i, a in enumerate(analyses)
+        if a["is_public"] and a["condition"]["strong_count"] > 0
+    ]
+
+    privesc_count = sum(
+        len(a["privesc_findings"]) for a in analyses
+    )
+
+    mitigated = [
+        i + 1
+        for i, a in enumerate(analyses)
+        if a["condition"]["strong_count"] > 0
+    ]
+
     worst = highest_severity(severities)
 
     print("=" * 55)
@@ -497,12 +680,33 @@ def print_overall_summary(analyses, severities):
     print(f"Total statements       : {total}")
     print(f"Allow statements       : {allow_count}")
     print(f"Deny statements        : {deny_count}")
+
     print(f"Overly permissive      : {len(risky)}")
     if risky:
         print(f"Risky statement #s     : {', '.join(map(str, risky))}")
-    print(f"Public access          : {len(public)}")
+
+    print(f"Wildcard principal     : {len(public)}")
     if public:
-        print(f"Public statement #s    : {', '.join(map(str, public))}")
+        print(f"Wildcard statement #s  : {', '.join(map(str, public))}")
+
+    print(f"Without strong restriction: {len(public_without_strong)}")
+    if public_without_strong:
+        print(
+            "Potentially unrestricted #s: "
+            + ", ".join(map(str, public_without_strong))
+        )
+
+    print(f"With strong condition  : {len(public_with_strong)}")
+    if public_with_strong:
+        print(
+            "Conditioned statement #s: "
+            + ", ".join(map(str, public_with_strong))
+        )
+
+    print(f"With strong mitigations: {len(mitigated)}")
+    if mitigated:
+        print(f"Mitigated statement #s : {', '.join(map(str, mitigated))}")
+
     print(f"Privesc findings       : {privesc_count}")
     print(f"Highest severity       : {worst}")
 
@@ -511,6 +715,7 @@ def build_report(policy, policy_path, statements, analyses, severities):
     """Build a machine-readable report dict for --json output."""
     total_privesc = sum(len(a["privesc_findings"]) for a in analyses)
     public_count = sum(1 for a in analyses if a["is_public"])
+    mitigated_count = sum(1 for a in analyses if a["condition"]["strong_count"] > 0)
     return {
         "file": policy_path,
         "version": policy.get("Version", "unknown"),
@@ -518,12 +723,24 @@ def build_report(policy, policy_path, statements, analyses, severities):
             "total_statements": len(statements),
             "allow": sum(1 for a in analyses if a["effect"] == "Allow"),
             "deny": sum(1 for a in analyses if a["effect"] == "Deny"),
-            "overly_permissive": sum(
-                1 for a in analyses if a["is_overly_permissive"]
-            ),
+            "overly_permissive": sum(1 for a in analyses if a["is_overly_permissive"]),
             "public_access": public_count,
+            "with_strong_mitigations": mitigated_count,
             "privesc_findings": total_privesc,
             "highest_severity": highest_severity(severities),
+            "wildcard_principal_statements": sum(
+                1 for a in analyses if a["is_public"]
+            ),
+            "wildcard_principal_without_strong_condition": sum(
+                1
+                for a in analyses
+                if a["is_public"] and a["condition"]["strong_count"] == 0
+            ),
+            "wildcard_principal_with_strong_condition": sum(
+                1
+                for a in analyses
+                if a["is_public"] and a["condition"]["strong_count"] > 0
+            ),
         },
         "statements": [
             {
@@ -539,6 +756,10 @@ def build_report(policy, policy_path, statements, analyses, severities):
                 "principals": analysis["principals"],
                 "is_public": analysis["is_public"],
                 "has_condition": analysis["has_condition"],
+                "condition_mitigations": analysis["condition"]["mitigations"],
+                "condition_strong_count": analysis["condition"]["strong_count"],
+                "condition_weak_count": analysis["condition"]["weak_count"],
+                "no_effective_actions": analysis["no_effective_actions"],
                 "is_overly_permissive": analysis["is_overly_permissive"],
                 "risk_reasons": analysis["risk_reasons"],
                 "privesc_findings": analysis["privesc_findings"],
@@ -549,10 +770,17 @@ def build_report(policy, policy_path, statements, analyses, severities):
     }
 
 
+
 def main():
     args = parse_args()
     policy = load_policy(args.policy_file)
     statements = get_statements(policy)
+    if not isinstance(policy.get("Statement"), (dict, list, type(None))):
+        print("Error: IAM policy 'Statement' must be an object or array", file=sys.stderr)
+        sys.exit(1)
+    if any(not isinstance(statement, dict) for statement in statements):
+        print("Error: every IAM policy statement must be a JSON object", file=sys.stderr)
+        sys.exit(1)
 
     analyses = [analyze_statement(s) for s in statements]
     severities = [score_statement(a) for a in analyses]
@@ -582,6 +810,11 @@ def main():
                 )
                 print(
                     f"  [verbose] principals normalized: {analyses[i - 1]['principals']}"
+                )
+                print(
+                    f"  [verbose] condition strong/weak: "
+                    f"{analyses[i - 1]['condition']['strong_count']}/"
+                    f"{analyses[i - 1]['condition']['weak_count']}"
                 )
             print()
 
