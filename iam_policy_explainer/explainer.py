@@ -1,3 +1,14 @@
+"""IAM Policy Reader/Explainer.
+
+Reads an AWS IAM policy (identity or resource) from a local JSON file
+and prints a security summary: severity scoring, privilege-escalation
+detection, public-access flags, condition mitigations, and
+least-privilege suggestions.
+
+Part of the Week 2 security-tooling project.
+Stdlib-only runtime.
+"""
+
 import argparse
 import json
 import ipaddress
@@ -61,6 +72,9 @@ COMPUTE_ACTIONS = {
 
 SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 SEVERITY_LADDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+__version__ = "0.8.0"
+
 STRONG_CONDITION_KEYS = {
     "aws:sourceip",
     "aws:sourcevpc",
@@ -82,24 +96,55 @@ RESTRICTING_OPERATORS = {
 
 def parse_args():
     """Parse command-line arguments and return them."""
-    parser = argparse.ArgumentParser(
-        description="Read an IAM policy JSON file and print a human-readable summary."
+    epilog_text = (
+        "Examples:\n"
+        "  python3 explainer.py samples/admin.json\n"
+        "  python3 explainer.py samples/public_bucket.json --verbose\n"
+        "  python3 explainer.py samples/privesc.json --json | jq .summary\n"
+        "\n"
+        "Exit codes:\n"
+        "  0  No HIGH or CRITICAL findings\n"
+        "  1  At least one HIGH or CRITICAL finding, or input error\n"
+        "  2  Command-line usage error\n"
     )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read an IAM policy JSON file and print a human-readable security "
+            "summary: severity scoring, privilege-escalation detection, public "
+            "access flags, condition mitigations, and least-privilege suggestions."
+        ),
+        epilog=epilog_text,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
     parser.add_argument(
         "policy_file",
         type=str,
         help="Path to the IAM policy JSON file to analyze.",
     )
+
     parser.add_argument(
+        "-v",
         "--verbose",
         action="store_true",
-        help="Print normalized actions and resources for each statement.",
+        help="Print normalized actions, resources, principals, and condition counts.",
     )
+
     parser.add_argument(
+        "-j",
         "--json",
         action="store_true",
         help="Emit a machine-readable JSON report instead of human-readable text.",
     )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show the version and exit.",
+    )
+
     return parser.parse_args()
 
 
